@@ -130,7 +130,7 @@ module MemoryMutate
     sym_imm = gensym()
     exprs = [:( $sym_imm = false )]
     for (n,fA) in enumerate(fieldnames(T))
-      push!(exprs, :( f == $(QuoteNode(fA)) && ($sym_imm = $(!fieldtypes(T)[n].mutable)) ))
+      push!(exprs, :( f == $(QuoteNode(fA)) && ($sym_imm = $(!fieldtypes(T)[n] |> ismutabletype)) ))
     end
     push!(exprs, :( return $sym_imm ))
     return Expr(:block,exprs...)
@@ -157,7 +157,7 @@ module MemoryMutate
   refisbitstype_static( ::NTuple{N,T}    ) where {N,T}     = isbitstype(T) # can advance to the next level, if T wants so
   refisbitstype_static( ::SArray{E,T,N,M}) where {E,T,N,M} = isbitstype(T) # can advance to the next level, if T wants so
   # fieldisbitstype_static(::T, f::Symbol) where T = isbitstype(fieldtype(T,f))
-  ismutable_static(::T) where T = T.mutable
+  ismutable_static(::T) where T = T |> ismutabletype
   isreference_static(::T) where T = T <: Ref # note, that we have Ptr <: Ref
   (fieldoffset_static(::         T  , i::UInt64)::Int64) where T = fieldoffset(T,i)
   (fieldoffset_static(::RPtr{    T }, i::UInt64)::Int64) where T = fieldoffset(T,i)
@@ -249,7 +249,7 @@ module MemoryMutate
     end
     for (n,(fname,ftype)) in enumerate(zip(fnames,ftypes))
       action = :()
-      if B.mutable || B <: RPtr || B <: Ptr # B is mutable, so `pointer_from_objref(base)` is valid
+      if ismutabletype(B) || B <: RPtr || B <: Ptr # B is mutable, so `pointer_from_objref(base)` is valid
         if isbitstype(ftype) # write a bitstype into the memory of `base`
           mode == :assignment && ( action = :( @GC.preserve base unsafe_store!(reinterpret(Ptr{$(ftype)},pointer_or_pointer_from_objref(base)+off),rhs) ) )
           mode == :pointer    && ( action = :(                                 reinterpret(Ptr{$(ftype)},pointer_or_pointer_from_objref(base)+off)      ) )
@@ -274,7 +274,7 @@ module MemoryMutate
             mode == :assignment && ( action = :( @GC.preserve base unsafe_store!(reinterpret(Ptr{$(ftype)},ptr),rhs) ) )
             mode == :pointer    && ( action = :(                                 reinterpret(Ptr{$(ftype)},ptr)      ) )
           elseif writeReferences # write a reference into the memory at `ptr`
-            if ftype.mutable # `rhs` is already allocated and `pointer_from_objref(rhs)` is valid
+            if ftype |> ismutabletype # `rhs` is already allocated and `pointer_from_objref(rhs)` is valid
               mode == :assignment && (
                 action = :( @assert isa(rhs,$(ftype)) "The value to assign is of type '$($(R))', but the field to assign it to is of type '$($(ftype))'";
                   @GC.preserve base unsafe_store!(reinterpret(Ptr{Ptr{Nothing}},ptr),pointer_from_objref(rhs)) ) )
@@ -340,19 +340,19 @@ module MemoryMutate
     sym     = gensym()
     dims    = E.parameters
     strides = MemoryMutate.cumprod_SimpleVector(dims)
-    elsize  = T.isbitstype ? sizeof(T) : sizeof(Ptr{Nothing}) # nonbitstypes are stored as "hidden references"/pointers
+    elsize  = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Nothing}) # nonbitstypes are stored as "hidden references"/pointers
     index   = Expr(:call,:+,[:( (indices[$i]-1)*($s) ) for (i,s) in enumerate(strides)]...)
-    return T.isbitstype ? :( prev + $index * $elsize ) : :( $index * $elsize ) # if T is not a bitstype, then the array is not a bitstype and we will receive a pointer to the beginning of the array so the previous index has to be discarded
+    return isbitstype(T) ? :( prev + $index * $elsize ) : :( $index * $elsize ) # if T is not a bitstype, then the array is not a bitstype and we will receive a pointer to the beginning of the array so the previous index has to be discarded
   end
   @generated function (indexoffset_static(::Type{NTuple{N,T}}, prev::Int64, indices...) :: Int64) where {N,T} # obtain the offset into a NTuple (which is inlined and therefore we add the previous offset)
-    elsize = T.isbitstype ? sizeof(T) : sizeof(Ptr{Nothing}) # nonbitstypes are stored as "hidden references"/pointers
+    elsize = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Nothing}) # nonbitstypes are stored as "hidden references"/pointers
     index  = :( indices[1]-1 )
-    return T.isbitstype ? :( prev + $index * $elsize ) : :( $index * $elsize ) # if T is not a bitstype, then the array is not a bitstype and we will receive a pointer to the beginning of the array so the previous index has to be discarded
+    return isbitstype(T) ? :( prev + $index * $elsize ) : :( $index * $elsize ) # if T is not a bitstype, then the array is not a bitstype and we will receive a pointer to the beginning of the array so the previous index has to be discarded
   end
   (                    indexoffset_static(::Type{Ptr{T}}, prev::Int64            )::Int64) where T = Int64(0) # if there is no index, then we are dereferencing (!) and discard the previous offset (TODO: this logic should not belong to here)
   @generated function (indexoffset_static(::Type{Ptr{T}}, prev::Int64, indices...)::Int64) where {T} # obtain the offset into a Ptr as a C-Style Array (which is not inlined and therefore discard the previous offset)
     # @assert prev == 0
-    elsize = T.isbitstype ? sizeof(T) : sizeof(Ptr{Nothing}) # nonbitstypes are stored as "hidden references"/pointers
+    elsize = isbitstype(T) ? sizeof(T) : sizeof(Ptr{Nothing}) # nonbitstypes are stored as "hidden references"/pointers
     index  = :( indices[1]-1 )
     return :( $index * $elsize )
   end
@@ -365,9 +365,9 @@ module MemoryMutate
     return (
         T <: Ptr
       ? :(base+off) # if we are already a pointer, then just add the offset and discard the previous offset
-      : T.mutable
+      : (T |> ismutabletype)
       ? :( pointer_from_objref(base)+off ) # if we are mutable, the use `pointer_from_objref`, add the offset and discard the previous offset
-      : T.isbitstype
+      : (T |> isbitstype)
       ? :( prev+off ) # if we are a bitstype, then we're inlined, so just add the offset to the previous offset
       : (T <: SArray || T <: NTuple || T <: MArray) # NOTE: this is for non-bitstype (i.e. non-inlined) SArrays/NTuples. TODO: MArray? at least throw an error
       ? :( @GC.preserve basebase unsafe_load(unsafe_load(reinterpret(Ptr{Ptr{Ptr{Nothing}}},prev)))+off ) # expect a pointer-pointer-pointer at the previous offset, dereference that pointer twice, and add the offset to it
@@ -380,7 +380,7 @@ module MemoryMutate
            ? :( base   + off )
            : T <: RPtr
            ? :( base.x + off )
-           : T.mutable
+           : T |> ismutabletype
            ? :( pointer_from_objref(base) + off )
            : :( nothing )
            )
